@@ -1,0 +1,28 @@
+"""Discovery metadata for OpenID Connect RP-Initiated Logout 1.0.
+
+https://openid.net/specs/openid-connect-rpinitiated-1_0.html
+"""
+
+from authlib.common.security import is_secure_transport
+
+
+class OpenIDProviderMetadata(dict):
+    """OpenID Provider metadata for RP-Initiated Logout 1.0.
+
+    This class defines the ``end_session_endpoint`` metadata field. It can be
+    combined with the base ``OpenIDProviderMetadata`` from
+    ``authlib.oidc.discovery`` when building discovery responses.
+    """
+
+    REGISTRY_KEYS = ["end_session_endpoint"]
+
+    def validate_end_session_endpoint(self):
+        """OPTIONAL. URL at the OP to which an RP can perform a redirect to
+        request that the End-User be logged out at the OP.
+
+        This URL MUST use the "https" scheme and MAY contain port, path, and
+        query parameter components.
+        """
+        url = self.get("end_session_endpoint")
+        if url and not is_secure_transport(url):
+            raise ValueError('"end_session_endpoint" MUST use "https" scheme')
