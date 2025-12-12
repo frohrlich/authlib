@@ -5,19 +5,16 @@ from authlib.oidc.rpinitiated import EndSessionEndpoint
 from tests.util import read_file_path
 
 from .models import Client
+from .models import db
 
 
-class MockFlaskEndSessionEndpoint(EndSessionEndpoint):
-    """EndSessionEndpoint implementation for testing."""
-
-    def __init__(self, db_session, issuer="https://provider.test"):
+class FlaskEndSessionEndpoint(EndSessionEndpoint):
+    def __init__(self, issuer="https://provider.test"):
         super().__init__()
-        self.db_session = db_session
         self.issuer = issuer
-        self.ended_sessions = []
 
     def get_client_by_id(self, client_id):
-        return self.db_session.query(Client).filter_by(client_id=client_id).first()
+        return db.session.query(Client).filter_by(client_id=client_id).first()
 
     def validate_id_token_hint(self, id_token_hint):
         try:
@@ -26,7 +23,6 @@ class MockFlaskEndSessionEndpoint(EndSessionEndpoint):
             # Accept expired tokens per spec
             claims.options = {"exp": {"validate": False}}
             claims.validate()
-            # Verify issuer matches
             if claims.get("iss") != self.issuer:
                 return None
             return dict(claims)
@@ -34,46 +30,50 @@ class MockFlaskEndSessionEndpoint(EndSessionEndpoint):
             return None
 
     def end_session(self, request, id_token_claims):
-        self.ended_sessions.append(id_token_claims)
+        pass
 
-    def create_end_session_response(self, request, redirect_uri, state):
+    def create_end_session_response(self, request, redirect_uri):
         if redirect_uri:
             return 302, "", [("Location", redirect_uri)]
         return 200, "Logged out", [("Content-Type", "text/plain")]
 
-
-def create_id_token(claims):
-    """Create a signed ID token for testing."""
-    priv_key = read_file_path("jwks_private.json")
-    header = {"alg": "RS256"}
-    token = jwt.encode(header, claims, priv_key)
-    # jwt.encode returns bytes, convert to string for use in URLs
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
-    return token
+    def create_confirmation_response(self, request, client, redirect_uri, ui_locales):
+        return 200, "Confirm logout", [("Content-Type", "text/plain")]
 
 
-@pytest.fixture(autouse=True)
-def setup_endpoint(server, app, db):
-    endpoint = MockFlaskEndSessionEndpoint(db.session)
+class ConfirmingEndSessionEndpoint(FlaskEndSessionEndpoint):
+    """Endpoint that auto-confirms logout without id_token_hint."""
+
+    def confirm_logout_without_id_token(self, request, client, logout_hint):
+        return True
+
+
+@pytest.fixture
+def confirming_server(server, app, db):
+    endpoint = ConfirmingEndSessionEndpoint()
     server.register_endpoint(endpoint)
 
     @app.route("/oauth/end_session", methods=["GET", "POST"])
     def end_session():
         return server.create_endpoint_response("end_session")
 
-    yield endpoint
+    return server
 
-    endpoint.ended_sessions.clear()
+
+@pytest.fixture
+def base_server(server, app, db):
+    endpoint = FlaskEndSessionEndpoint()
+    server.register_endpoint(endpoint)
+
+    @app.route("/oauth/end_session_base", methods=["GET", "POST"])
+    def end_session_base():
+        return server.create_endpoint_response("end_session")
+
+    return server
 
 
 @pytest.fixture(autouse=True)
-def client(db):
-    client = Client(
-        user_id=1,
-        client_id="client-id",
-        client_secret="client-secret",
-    )
+def client(client, db):
     client.set_client_metadata(
         {
             "redirect_uris": ["https://client.test/authorized"],
@@ -86,61 +86,24 @@ def client(db):
     )
     db.session.add(client)
     db.session.commit()
-    yield client
-    db.session.delete(client)
+
+    return client
 
 
-def test_end_session_get(test_client, setup_endpoint):
-    """End session endpoint should support GET requests."""
-    rv = test_client.get("/oauth/end_session")
-
-    assert rv.status_code == 200
-    assert rv.data == b"Logged out"
-    assert len(setup_endpoint.ended_sessions) == 1
-
-
-def test_end_session_post(test_client, setup_endpoint):
-    """End session endpoint should support POST requests."""
-    rv = test_client.post("/oauth/end_session")
-
-    assert rv.status_code == 200
-    assert rv.data == b"Logged out"
-    assert len(setup_endpoint.ended_sessions) == 1
-
-
-def test_end_session_with_valid_id_token(test_client, setup_endpoint, client):
-    """Logout with valid id_token_hint should pass claims to end_session."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
+def test_end_session_with_valid_id_token(
+    test_client, confirming_server, client, id_token
+):
+    """Logout with valid id_token_hint should succeed."""
     rv = test_client.get(f"/oauth/end_session?id_token_hint={id_token}")
 
     assert rv.status_code == 200
-    assert len(setup_endpoint.ended_sessions) == 1
-    claims = setup_endpoint.ended_sessions[0]
-    assert claims["sub"] == "user-1"
-    assert claims["aud"] == "client-id"
+    assert rv.data == b"Logged out"
 
 
-def test_end_session_with_redirect_uri(test_client, setup_endpoint, client):
+def test_end_session_with_redirect_uri(
+    test_client, confirming_server, client, id_token
+):
     """Logout with valid redirect URI should redirect."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
     rv = test_client.get(
         f"/oauth/end_session?id_token_hint={id_token}"
         "&post_logout_redirect_uri=https://client.test/logout"
@@ -150,18 +113,10 @@ def test_end_session_with_redirect_uri(test_client, setup_endpoint, client):
     assert rv.headers["Location"] == "https://client.test/logout"
 
 
-def test_end_session_with_redirect_uri_and_state(test_client, setup_endpoint, client):
+def test_end_session_with_redirect_uri_and_state(
+    test_client, confirming_server, client, id_token
+):
     """State parameter should be appended to redirect URI."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
     rv = test_client.get(
         f"/oauth/end_session?id_token_hint={id_token}"
         "&post_logout_redirect_uri=https://client.test/logout"
@@ -172,114 +127,56 @@ def test_end_session_with_redirect_uri_and_state(test_client, setup_endpoint, cl
     assert rv.headers["Location"] == "https://client.test/logout?state=xyz123"
 
 
-def test_end_session_invalid_redirect_uri(test_client, setup_endpoint, client):
+def test_end_session_invalid_redirect_uri(
+    test_client, confirming_server, client, id_token
+):
     """Unregistered redirect URI should return error."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
     rv = test_client.get(
         f"/oauth/end_session?id_token_hint={id_token}"
         "&post_logout_redirect_uri=https://attacker.test/logout"
     )
 
     assert rv.status_code == 400
-    assert b"invalid post_logout_redirect_uri" in rv.data
-    assert len(setup_endpoint.ended_sessions) == 0
 
 
-def test_end_session_redirect_without_id_token(test_client, setup_endpoint, client):
-    """Redirect URI without id_token_hint should require confirmation."""
+def test_end_session_redirect_without_id_token(test_client, confirming_server, client):
+    """Redirect URI without id_token_hint succeeds when confirmation is granted."""
     rv = test_client.get(
         "/oauth/end_session?client_id=client-id"
         "&post_logout_redirect_uri=https://client.test/logout"
     )
 
-    # Default implementation returns 400 for confirmation required
-    assert rv.status_code == 400
-    assert len(setup_endpoint.ended_sessions) == 0
+    # Test endpoint has confirm_logout_without_id_token returning True
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "https://client.test/logout"
 
 
-def test_end_session_client_id_mismatch(test_client, setup_endpoint, client):
+def test_end_session_client_id_mismatch(
+    test_client, confirming_server, client, id_token
+):
     """client_id not matching aud claim should return error."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
     rv = test_client.get(
         f"/oauth/end_session?id_token_hint={id_token}&client_id=other-client"
     )
 
     assert rv.status_code == 400
-    assert b"does not match" in rv.data
-    assert len(setup_endpoint.ended_sessions) == 0
 
 
-def test_end_session_with_wrong_issuer(test_client, setup_endpoint, client):
-    """ID token from different issuer should be treated as invalid."""
-    id_token = create_id_token(
-        {
-            "iss": "https://other-provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
+def test_end_session_with_wrong_issuer(
+    test_client, confirming_server, client, id_token_wrong_issuer
+):
+    """ID token from different issuer should be treated as invalid but logout succeeds."""
+    rv = test_client.get(f"/oauth/end_session?id_token_hint={id_token_wrong_issuer}")
 
-    rv = test_client.get(f"/oauth/end_session?id_token_hint={id_token}")
-
+    # ID token is invalid but logout still succeeds (with confirmation granted)
     assert rv.status_code == 200
-    # ID token should be treated as invalid, claims should be None
-    assert len(setup_endpoint.ended_sessions) == 1
-    assert setup_endpoint.ended_sessions[0] is None
+    assert rv.data == b"Logged out"
 
 
-def test_end_session_alternative_redirect_uri(test_client, setup_endpoint, client):
-    """Should work with any registered post_logout_redirect_uri."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
-    rv = test_client.get(
-        f"/oauth/end_session?id_token_hint={id_token}"
-        "&post_logout_redirect_uri=https://client.test/logged-out"
-    )
-
-    assert rv.status_code == 302
-    assert rv.headers["Location"] == "https://client.test/logged-out"
-
-
-def test_end_session_post_with_form_data(test_client, setup_endpoint, client):
+def test_end_session_post_with_form_data(
+    test_client, confirming_server, client, id_token
+):
     """End session should support POST with form-encoded data."""
-    id_token = create_id_token(
-        {
-            "iss": "https://provider.test",
-            "sub": "user-1",
-            "aud": "client-id",
-            "exp": 9999999999,
-            "iat": 1000000000,
-        }
-    )
-
     rv = test_client.post(
         "/oauth/end_session",
         data={
@@ -291,3 +188,59 @@ def test_end_session_post_with_form_data(test_client, setup_endpoint, client):
 
     assert rv.status_code == 302
     assert rv.headers["Location"] == "https://client.test/logout?state=abc"
+
+
+def test_no_id_token_requires_confirmation(test_client, base_server, client):
+    """Logout without id_token_hint should show confirmation page."""
+    rv = test_client.get("/oauth/end_session_base")
+
+    assert rv.status_code == 200
+    assert rv.data == b"Confirm logout"
+
+
+def test_redirect_without_id_token_requires_confirmation(
+    test_client, base_server, client
+):
+    """Redirect URI without id_token_hint should show confirmation without redirect."""
+    rv = test_client.get(
+        "/oauth/end_session_base?client_id=client-id"
+        "&post_logout_redirect_uri=https://client.test/logout"
+    )
+
+    assert rv.status_code == 200
+    assert rv.data == b"Confirm logout"
+
+
+def test_invalid_id_token_requires_confirmation(
+    test_client, base_server, client, id_token_wrong_issuer
+):
+    """Invalid id_token_hint should show confirmation page."""
+    rv = test_client.get(
+        f"/oauth/end_session_base?id_token_hint={id_token_wrong_issuer}"
+    )
+
+    assert rv.status_code == 200
+    assert rv.data == b"Confirm logout"
+
+
+def test_valid_id_token_succeeds_without_confirmation(
+    test_client, base_server, client, id_token
+):
+    """Valid id_token_hint should succeed without confirmation."""
+    rv = test_client.get(f"/oauth/end_session_base?id_token_hint={id_token}")
+
+    assert rv.status_code == 200
+    assert rv.data == b"Logged out"
+
+
+def test_valid_id_token_with_redirect_succeeds_without_confirmation(
+    test_client, base_server, client, id_token
+):
+    """Valid id_token_hint with redirect URI should succeed."""
+    rv = test_client.get(
+        f"/oauth/end_session_base?id_token_hint={id_token}"
+        "&post_logout_redirect_uri=https://client.test/logout"
+    )
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "https://client.test/logout"

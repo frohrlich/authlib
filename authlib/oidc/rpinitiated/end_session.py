@@ -78,13 +78,7 @@ class EndSessionEndpoint:
         if client_id:
             client = self.get_client_by_id(client_id)
         elif id_token_claims:
-            aud = id_token_claims.get("aud")
-            if isinstance(aud, list):
-                # The user should specify how to define from the audience list if a client was recently logged in
-                # They should return the client in question
-                aud = aud[0] if aud else None
-            if aud:
-                client = self.get_client_by_id(aud)
+            client = self.resolve_client_from_id_token_claims(id_token_claims)
 
         if client_id and id_token_claims:
             aud = id_token_claims.get("aud")
@@ -100,23 +94,23 @@ class EndSessionEndpoint:
                 raise InvalidRequestError(
                     "Invalid 'post_logout_redirect_uri' for client"
                 )
-
-            if not id_token_claims:
-                if not self.confirm_logout_without_id_token(
-                    request, client, logout_hint
-                ):
-                    raise InvalidRequestError(
-                        "'id_token_hint' is required for 'post_logout_redirect_uri'"
-                    )
             redirect_uri = post_logout_redirect_uri
             if state:
                 redirect_uri = add_params_to_uri(redirect_uri, dict(state=state))
 
-        if not id_token_claims:
-            if not self.confirm_logout_without_id_token(request, client, logout_hint):
-                return self.create_confirmation_response(
-                    request, client, redirect_uri, ui_locales
-                )
+        if not id_token_claims and not self.confirm_logout_without_id_token(
+            request, client, logout_hint
+        ):
+            # An id_token_hint carring an ID Token for the RP is also RECOMMENDED
+            # when requesting post-logout redirection; if it is not supplied with
+            # post_logout_redirect_uri, the OP MUST NOT perform post-logout
+            # redirection unless the OP has other means of confirming the legitimacy
+            # of the post-logout redirection target.
+            redirect_uri = None
+
+            return self.create_confirmation_response(
+                request, client, redirect_uri, ui_locales
+            )
 
         # Perform logout
         self.end_session(request, id_token_claims)
@@ -146,6 +140,38 @@ class EndSessionEndpoint:
         :return: The client object or None.
         """
         raise NotImplementedError()
+
+    def resolve_client_from_id_token_claims(self, id_token_claims: dict):
+        """Resolve the client from ID token claims when client_id is not provided.
+
+        When an id_token_hint is provided without an explicit client_id parameter,
+        this method determines which client initiated the logout request based on
+        the token claims. The ``aud`` claim may be a single string or an array of
+        client identifiers.
+
+        Override this method to implement custom logic for determining the client,
+        for example by checking which client the user has an active session with::
+
+            def resolve_client_from_id_token_claims(self, id_token_claims):
+                aud = id_token_claims.get("aud")
+                if isinstance(aud, str):
+                    return self.get_client_by_id(aud)
+                # Check which client has an active session
+                for client_id in aud:
+                    if self.has_active_session_for_client(client_id):
+                        return self.get_client_by_id(client_id)
+                return None
+
+        By default, returns None requiring the client_id parameter to be provided
+        explicitly when the ``aud`` claim is an array.
+
+        :param id_token_claims: The validated ID token claims dictionary.
+        :return: The client object or None.
+        """
+        aud = id_token_claims.get("aud")
+        if isinstance(aud, str):
+            return self.get_client_by_id(aud)
+        return None
 
     def validate_id_token_hint(self, id_token_hint: str) -> Optional[dict]:
         """Validate an ID token hint and return its claims.
@@ -259,4 +285,3 @@ class EndSessionEndpoint:
         :return: A tuple of (status_code, body, headers).
         """
         return 400, "Logout confirmation required", []
-
