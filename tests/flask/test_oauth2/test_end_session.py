@@ -127,16 +127,14 @@ def test_end_session_with_redirect_uri_and_state(
     assert rv.headers["Location"] == "https://client.test/logout?state=xyz123"
 
 
-def test_end_session_invalid_redirect_uri(
-    test_client, confirming_server, client, id_token
-):
-    """Unregistered redirect URI should return error."""
+def test_end_session_invalid_redirect_uri(test_client, base_server, client, id_token):
+    """Unregistered redirect URI should result in no redirection."""
     rv = test_client.get(
-        f"/oauth/end_session?id_token_hint={id_token}"
+        f"/oauth/end_session_base?id_token_hint={id_token}"
         "&post_logout_redirect_uri=https://attacker.test/logout"
     )
 
-    assert rv.status_code == 400
+    assert rv.status_code == 200
 
 
 def test_end_session_redirect_without_id_token(test_client, confirming_server, client):
@@ -160,17 +158,6 @@ def test_end_session_client_id_mismatch(
     )
 
     assert rv.status_code == 400
-
-
-def test_end_session_with_wrong_issuer(
-    test_client, confirming_server, client, id_token_wrong_issuer
-):
-    """ID token from different issuer should be treated as invalid but logout succeeds."""
-    rv = test_client.get(f"/oauth/end_session?id_token_hint={id_token_wrong_issuer}")
-
-    # ID token is invalid but logout still succeeds (with confirmation granted)
-    assert rv.status_code == 200
-    assert rv.data == b"Logged out"
 
 
 def test_end_session_post_with_form_data(

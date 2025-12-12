@@ -70,6 +70,8 @@ class EndSessionEndpoint:
         state = data.get("state")
         ui_locales = data.get("ui_locales")
 
+        # When an id_token_hint parameter is present, the OP MUST validate that it
+        # was the issuer of the ID Token.
         id_token_claims = None
         if id_token_hint:
             id_token_claims = self.validate_id_token_hint(id_token_hint)
@@ -80,6 +82,8 @@ class EndSessionEndpoint:
         elif id_token_claims:
             client = self.resolve_client_from_id_token_claims(id_token_claims)
 
+        # When both client_id and id_token_hint are present, the OP MUST verify
+        # that the Client Identifier matches the one used when issuing the ID Token.
         if client_id and id_token_claims:
             aud = id_token_claims.get("aud")
             aud_list = [aud] if isinstance(aud, str) else (aud or [])
@@ -87,13 +91,17 @@ class EndSessionEndpoint:
                 raise InvalidRequestError("'client_id' does not match 'aud' claim")
 
         redirect_uri = None
-        if post_logout_redirect_uri:
-            if not self._validate_post_logout_redirect_uri(
+        if (
+            post_logout_redirect_uri
+            and self._validate_post_logout_redirect_uri(
                 client, post_logout_redirect_uri
-            ):
-                raise InvalidRequestError(
-                    "Invalid 'post_logout_redirect_uri' for client"
-                )
+            )
+        ) and (
+            id_token_claims
+            or self.confirm_logout_without_id_token(
+                client, post_logout_redirect_uri, logout_hint
+            )
+        ):
             redirect_uri = post_logout_redirect_uri
             if state:
                 redirect_uri = add_params_to_uri(redirect_uri, dict(state=state))
@@ -101,18 +109,10 @@ class EndSessionEndpoint:
         if not id_token_claims and not self.confirm_logout_without_id_token(
             request, client, logout_hint
         ):
-            # An id_token_hint carring an ID Token for the RP is also RECOMMENDED
-            # when requesting post-logout redirection; if it is not supplied with
-            # post_logout_redirect_uri, the OP MUST NOT perform post-logout
-            # redirection unless the OP has other means of confirming the legitimacy
-            # of the post-logout redirection target.
-            redirect_uri = None
-
             return self.create_confirmation_response(
                 request, client, redirect_uri, ui_locales
             )
 
-        # Perform logout
         self.end_session(request, id_token_claims)
 
         return self.create_end_session_response(request, redirect_uri)
