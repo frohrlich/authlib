@@ -6,6 +6,8 @@ https://openid.net/specs/openid-connect-rpinitiated-1_0.html
 from typing import Optional
 
 from authlib.common.urls import add_params_to_uri
+from authlib.jose import jwt
+from authlib.jose.errors import JoseError
 from authlib.oauth2.rfc6749 import OAuth2Request
 from authlib.oauth2.rfc6749.errors import InvalidRequestError
 
@@ -74,7 +76,9 @@ class EndSessionEndpoint:
         # was the issuer of the ID Token.
         id_token_claims = None
         if id_token_hint:
-            id_token_claims = self.validate_id_token_hint(id_token_hint)
+            id_token_claims = self._validate_id_token_hint(id_token_hint)
+            if not self.validate_id_token_claims(id_token_claims):
+                id_token_claims = None
 
         client = None
         if client_id:
@@ -98,7 +102,7 @@ class EndSessionEndpoint:
             )
         ) and (
             id_token_claims
-            or self.confirm_logout_without_id_token(
+            or self.is_post_logout_redirect_uri_legitimate(
                 client, post_logout_redirect_uri, logout_hint
             )
         ):
@@ -106,16 +110,19 @@ class EndSessionEndpoint:
             if state:
                 redirect_uri = add_params_to_uri(redirect_uri, dict(state=state))
 
-        if not id_token_claims and not self.confirm_logout_without_id_token(
-            request, client, logout_hint
-        ):
+        # Logout requests without a valid id_token_hint value are a potential means
+        # of denial of service; therefore, OPs should obtain explicit confirmation
+        # from the End-User before acting upon them.
+        if not id_token_claims and self.need_confirmation_response():
             return self.create_confirmation_response(
                 request, client, redirect_uri, ui_locales
             )
 
         self.end_session(request, id_token_claims)
 
-        return self.create_end_session_response(request, redirect_uri)
+        if redirect_uri:
+            return 302, "", [("Location", redirect_uri)]
+        return self.create_end_session_response(request)
 
     def _validate_post_logout_redirect_uri(
         self, client, post_logout_redirect_uri: str
@@ -173,7 +180,10 @@ class EndSessionEndpoint:
             return self.get_client_by_id(aud)
         return None
 
-    def validate_id_token_hint(self, id_token_hint: str) -> Optional[dict]:
+    def get_server_jwks(self):
+        raise NotImplementedError()
+
+    def validate_id_token_claims(self, id_token_claims: str) -> bool:
         """Validate an ID token hint and return its claims.
 
         This method must be implemented by developers. It should verify that
@@ -181,21 +191,26 @@ class EndSessionEndpoint:
         expired ``exp`` claims if the session is still active::
 
             def validate_id_token_hint(self, id_token_hint):
-                try:
-                    claims = jwt.decode(
-                        id_token_hint,
-                        public_key,
-                        claims_options={"exp": {"validate": lambda c: True}},
-                    )
-                    claims.validate()
-                    return claims
-                except JoseError:
-                    return None
+                if id_token_hint["sid"] not in current_sessions(id_token_hint["aud"]):
+                    return False
+                retuen True
 
         :param id_token_hint: The ID token string.
         :return: The token claims dict if valid, None otherwise.
         """
-        raise NotImplementedError()
+        return True
+
+    def _validate_id_token_hint(self, id_token_hint):
+        try:
+            claims = jwt.decode(
+                id_token_hint,
+                self.get_server_jwks(),
+                claims_options={"exp": {"validate": lambda c: True}},
+            )
+            claims.validate()
+            return claims
+        except JoseError:
+            return None
 
     def end_session(self, request: OAuth2Request, id_token_claims: Optional[dict]):
         """Perform the actual session termination.
@@ -214,25 +229,20 @@ class EndSessionEndpoint:
         """
         raise NotImplementedError()
 
-    def create_end_session_response(
-        self, request: OAuth2Request, redirect_uri: Optional[str]
-    ):
-        """Create the response after successful logout.
+    def create_end_session_response(self, request: OAuth2Request):
+        """Create the response after successful logout when there is no valid redirect uri.
 
         This method must be implemented by developers::
 
-            def create_end_session_response(self, request, redirect_uri):
-                if redirect_uri:
-                    return 302, "", [("Location", redirect_uri)]
+            def create_end_session_response(self, request):
                 return 200, "You have been logged out.", []
 
         :param request: The OAuth2Request object.
-        :param redirect_uri: The URI to redirect to, or None.
         :return: A tuple of (status_code, body, headers).
         """
         raise NotImplementedError()
 
-    def confirm_logout_without_id_token(
+    def is_post_logout_redirect_uri_legitimate(
         self,
         request: OAuth2Request,
         client,
@@ -241,7 +251,7 @@ class EndSessionEndpoint:
         """Determine if logout can proceed without a valid id_token_hint.
 
         When post_logout_redirect_uri is provided but id_token_hint is missing
-        or invalid, the OP should require user confirmation to prevent DoS.
+        or invalid, the OP should require user confirmation.
         Override this method if you have alternative confirmation mechanisms.
 
         By default, returns False to require confirmation.
@@ -285,3 +295,6 @@ class EndSessionEndpoint:
         :return: A tuple of (status_code, body, headers).
         """
         return 400, "Logout confirmation required", []
+
+    def need_confirmation_response(self) -> bool:
+        return True

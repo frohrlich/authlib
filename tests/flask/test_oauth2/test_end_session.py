@@ -16,7 +16,7 @@ class FlaskEndSessionEndpoint(EndSessionEndpoint):
     def get_client_by_id(self, client_id):
         return db.session.query(Client).filter_by(client_id=client_id).first()
 
-    def validate_id_token_hint(self, id_token_hint):
+    def validate_id_token_claims(self, id_token_hint):
         try:
             pub_key = read_file_path("jwks_public.json")
             claims = jwt.decode(id_token_hint, pub_key)
@@ -44,7 +44,7 @@ class FlaskEndSessionEndpoint(EndSessionEndpoint):
 class ConfirmingEndSessionEndpoint(FlaskEndSessionEndpoint):
     """Endpoint that auto-confirms logout without id_token_hint."""
 
-    def confirm_logout_without_id_token(self, request, client, logout_hint):
+    def is_post_logout_redirect_uri_legitimate(self, request, client, logout_hint):
         return True
 
 
