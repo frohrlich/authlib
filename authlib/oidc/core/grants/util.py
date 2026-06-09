@@ -21,6 +21,8 @@ def is_openid_scope(scope):
 
 
 def validate_request_prompt(grant, redirect_uri, redirect_fragment=False):
+    # http://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+
     prompt = grant.request.payload.data.get("prompt")
     end_user = grant.request.user
     if not prompt:
@@ -43,9 +45,25 @@ def validate_request_prompt(grant, redirect_uri, redirect_fragment=False):
             redirect_fragment=redirect_fragment,
         )
 
-    prompt = _guess_prompt_value(
-        end_user, prompts, redirect_uri, redirect_fragment=redirect_fragment
-    )
+    if "create" in prompts:
+        prompt = "create"
+    elif "none" in prompts:
+        prompt = "none"
+    elif not end_user or "login" in prompts:
+        prompt = "login"
+    elif "consent" in prompts:
+        if not end_user:
+            raise ConsentRequiredError(
+                redirect_uri=redirect_uri, redirect_fragment=redirect_fragment
+            )
+        prompt = "consent"
+    elif "select_account" in prompts:
+        if not end_user:
+            raise AccountSelectionRequiredError(
+                redirect_uri=redirect_uri, redirect_fragment=redirect_fragment
+            )
+        prompt = "select_account"
+
     if prompt:
         grant.prompt = prompt
     return grant
@@ -145,23 +163,3 @@ def create_response_mode_response(redirect_uri, params, response_mode):
         raise InvalidRequestError('Invalid "response_mode" value')
 
     return 302, "", [("Location", uri)]
-
-
-def _guess_prompt_value(end_user, prompts, redirect_uri, redirect_fragment):
-    # http://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
-
-    if not end_user or "login" in prompts:
-        return "login"
-
-    if "consent" in prompts:
-        if not end_user:
-            raise ConsentRequiredError(
-                redirect_uri=redirect_uri, redirect_fragment=redirect_fragment
-            )
-        return "consent"
-    elif "select_account" in prompts:
-        if not end_user:
-            raise AccountSelectionRequiredError(
-                redirect_uri=redirect_uri, redirect_fragment=redirect_fragment
-            )
-        return "select_account"
