@@ -26,7 +26,7 @@ def validate_request_prompt(grant, redirect_uri, redirect_fragment=False):
     prompt = grant.request.payload.data.get("prompt")
     end_user = grant.request.user
     if not prompt:
-        if not end_user:
+        if not end_user or _is_max_age_exceeded(grant):
             grant.prompt = "login"
         return grant
 
@@ -49,7 +49,7 @@ def validate_request_prompt(grant, redirect_uri, redirect_fragment=False):
         prompt = "create"
     elif "none" in prompts:
         prompt = "none"
-    elif not end_user or "login" in prompts:
+    elif not end_user or "login" in prompts or _is_max_age_exceeded(grant):
         prompt = "login"
     elif "consent" in prompts:
         if not end_user:
@@ -67,6 +67,18 @@ def validate_request_prompt(grant, redirect_uri, redirect_fragment=False):
     if prompt:
         grant.prompt = prompt
     return grant
+
+
+def _is_max_age_exceeded(grant):
+    max_age = grant.request.payload.data.get("max_age")
+    if max_age is None:
+        return False
+
+    auth_time = grant.request.user.auth_time
+    if auth_time is None:
+        return False
+
+    return time.time() - auth_time > max_age
 
 
 def validate_nonce(request, exists_nonce, required=False):
